@@ -1,0 +1,30 @@
+name: Validate Kubernetes manifests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Test validator and API
+        run: python -m pytest tests -q
+      - name: Validate the sample deployment
+        run: python cli.py examples/valid.yaml --report reports/manifest-report.json
+      - name: Build the deployment image
+        run: docker build -t kubernetes-manifest-debugger:ci .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation-report
+          path: reports/
+          if-no-files-found: ignore

@@ -1,0 +1,52 @@
+name: Deploy to Elastic Beanstalk (manual)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: elastic-beanstalk-deployment
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: aws-deployment
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EB_APPLICATION: ${{ vars.EB_APPLICATION }}
+      EB_ENVIRONMENT: ${{ vars.EB_ENVIRONMENT }}
+      EB_SOURCE_BUCKET: ${{ vars.EB_SOURCE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest tests -q
+      - run: python cli.py examples/valid.yaml
+      - run: docker build -t kubernetes-manifest-debugger:deploy .
+      - name: Check configuration
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          test -n "$AWS_REGION"
+          test -n "$EB_APPLICATION"
+          test -n "$EB_ENVIRONMENT"
+          test -n "$EB_SOURCE_BUCKET"
+          test -n "$AWS_ROLE_ARN"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Package and deploy
+        run: |
+          VERSION_LABEL="manifest-${GITHUB_SHA}-${GITHUB_RUN_ID}"
+          BUNDLE_PATH="/tmp/${VERSION_LABEL}.zip"
+          python scripts/package_source.py . "$BUNDLE_PATH"
+          aws s3 cp "$BUNDLE_PATH" "s3://${EB_SOURCE_BUCKET}/${VERSION_LABEL}.zip"
+          aws elasticbeanstalk create-application-version --application-name "$EB_APPLICATION" --version-label "$VERSION_LABEL" --source-bundle "S3Bucket=${EB_SOURCE_BUCKET},S3Key=${VERSION_LABEL}.zip"
+          aws elasticbeanstalk update-environment --environment-name "$EB_ENVIRONMENT" --version-label "$VERSION_LABEL"
+          aws elasticbeanstalk wait environment-updated --environment-names "$EB_ENVIRONMENT"
+          aws elasticbeanstalk describe-environments --environment-names "$EB_ENVIRONMENT" --query 'Environments[0].{Status:Status,Health:Health,CNAME:CNAME}'
