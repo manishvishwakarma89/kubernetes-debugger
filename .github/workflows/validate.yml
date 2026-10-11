@@ -21,7 +21,7 @@ jobs:
       - name: Validate the sample deployment
         run: python cli.py examples/valid.yaml --report reports/manifest-report.json
       - name: Build the deployment image
-        run: docker build -t kubernetes-manifest-debugger:ci .
+        run: docker build -t kubernetes-integrated-debugger:ci .
       - uses: actions/upload-artifact@v4
         if: always()
         with:

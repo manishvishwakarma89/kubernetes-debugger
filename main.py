@@ -1,71 +1,123 @@
-"""Authenticated, bounded manifest validation API. Nothing is deployed to a cluster."""
-import json
+"""Main class registers FastAPI routes using decorators."""
 import os
-from pathlib import Path
 import secrets
-import threading
+from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from docker.errors import DockerException, NotFound
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from requests.exceptions import RequestException
+
+from docker_debugger import DockerDebugger
+from scout_jobs import ScoutJobs
+from auth import require_token
 from fastapi.responses import FileResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from starlette.concurrency import run_in_threadpool
-
-from validator import analyze, InputError, VERSIONS
-
-app = FastAPI(title="Kubernetes Manifest Debugger", version="1.0.0")
-slots = threading.BoundedSemaphore(4)
-auth = HTTPBearer(auto_error=False)
+from pathlib import Path
+import kubernetes_api
 
 
-def require_token(credentials: HTTPAuthorizationCredentials = Depends(auth)):
-    expected = os.getenv("DEBUGGER_API_TOKEN", "")
-    if len(expected) < 32:
-        raise HTTPException(503, "Configure DEBUGGER_API_TOKEN with at least 32 random characters.")
-    if credentials is None or not secrets.compare_digest(credentials.credentials.encode(), expected.encode()):
-        raise HTTPException(401, "Invalid access token.", headers={"WWW-Authenticate": "Bearer"})
+class DockerDebuggerApp:
+    def __init__(self):
+        self.app = FastAPI(title="Docker & Kubernetes Debugger", version="2.0.0")
+        self.scout_jobs = ScoutJobs()
+        self.register_routes()
 
+    check_token = staticmethod(require_token)
 
-@app.get("/")
-def home():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
-
-
-@app.get("/healthz")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/versions", dependencies=[Depends(require_token)])
-def versions():
-    return {"versions": VERSIONS, "default": "1.34.0"}
-
-
-@app.post("/validate", dependencies=[Depends(require_token)], openapi_extra={
-    "requestBody": {"required": True, "content": {"application/json": {
-        "schema": {"type": "object", "required": ["manifest"], "additionalProperties": False,
-                   "properties": {"manifest": {"type": "string", "maxLength": 524288},
-                                  "kubernetes_version": {"type": "string", "enum": list(VERSIONS), "default": "1.34.0"}}},
-        "example": {"manifest": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\ndata:\n  example: value\n", "kubernetes_version": "1.34.0"}
-    }}}
-})
-async def validate_manifest(request: Request):
-    if not slots.acquire(blocking=False):
-        raise HTTPException(429, "Validation capacity reached. Try again shortly.")
-    try:
-        data = bytearray()
-        async for chunk in request.stream():
-            data.extend(chunk)
-            if len(data) > 1024 * 1024:
-                raise HTTPException(413, "Request exceeds the 1 MiB limit.")
+    def get_debugger(self):
+        debugger = None
         try:
-            payload = json.loads(data)
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPException(400, "Send JSON with a manifest string and optional kubernetes_version.")
-        if not isinstance(payload, dict) or set(payload) - {"manifest", "kubernetes_version"}:
-            raise HTTPException(400, "Accepted fields: manifest and kubernetes_version.")
-        try:
-            return await run_in_threadpool(analyze, payload.get("manifest"), payload.get("kubernetes_version", "1.34.0"))
-        except InputError as error:
+            debugger = DockerDebugger()
+            yield debugger
+        except NotFound:
+            raise HTTPException(404, "Container not found.")
+        except ValueError as error:
             raise HTTPException(400, str(error))
-    finally:
-        slots.release()
+        except (DockerException, RequestException):
+            raise HTTPException(502, "Cannot communicate with Docker. Check the connection and permissions.")
+        finally:
+            if debugger is not None:
+                debugger.close()
+
+    def register_routes(self):
+        app = self.app
+        protected = [Depends(self.check_token)]
+
+        @app.get("/")
+        def home():
+            return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+        @app.get("/healthz")
+        def health():
+            return {"status": "ok"}
+
+        @app.get("/containers", dependencies=protected)
+        def containers(debugger=Depends(self.get_debugger)):
+            return debugger.list_containers()
+
+        @app.get("/images", dependencies=protected)
+        def images(debugger=Depends(self.get_debugger)):
+            return debugger.list_images()
+
+        @app.post("/images/scout", status_code=202, dependencies=protected)
+        def start_scout(
+            image_name: str = Query(..., min_length=1, max_length=255),
+            source: Literal["local", "registry"] = Query("registry"),
+        ):
+            """Start a background scan, then poll status_url for progress and results."""
+            try:
+                return self.scout_jobs.submit(image_name, source)
+            except ValueError as error:
+                raise HTTPException(400, str(error))
+            except BlockingIOError as error:
+                raise HTTPException(429, str(error))
+
+        @app.get("/images/scout/jobs/{job_id}", dependencies=protected)
+        def scout_job(job_id: str):
+            """Read job state. Results expire after 30 minutes or an app restart."""
+            try:
+                return self.scout_jobs.get(job_id)
+            except KeyError:
+                raise HTTPException(404, "Scan job not found or expired. Jobs are cleared on restart.")
+
+        @app.post("/images/scout/sync", dependencies=protected, include_in_schema=False)
+        def scout(
+            image_name: str = Query(..., min_length=1, max_length=255),
+            source: Literal["local", "registry"] = Query(
+                "registry", description="Registry is the default for published images without Docker Engine; local needs a connected Docker daemon."
+            ),
+        ):
+            try:
+                result = DockerDebugger.scout_scan(image_name, source=source)
+                if result["status"] == "execution_failed":
+                    raise HTTPException(502, detail=result)
+                return result
+            except ValueError as error:
+                raise HTTPException(400, str(error))
+            except BlockingIOError as error:
+                raise HTTPException(429, str(error))
+            except FileNotFoundError as error:
+                raise HTTPException(503, str(error))
+            except TimeoutError as error:
+                raise HTTPException(504, str(error))
+            except OSError:
+                raise HTTPException(502, "Docker Scout could not start. Check executable permissions.")
+
+        @app.get("/containers/{name}/logs", dependencies=protected)
+        def logs(name: str, tail: int = Query(200, ge=1, le=1000), debugger=Depends(self.get_debugger)):
+            return debugger.get_logs(name, tail)
+
+        @app.get("/containers/{name}/inspect", dependencies=protected)
+        def inspect(name: str, debugger=Depends(self.get_debugger)):
+            return debugger.inspect_container(name)
+
+        @app.get("/containers/{name}/metrics", dependencies=protected)
+        def metrics(name: str, debugger=Depends(self.get_debugger)):
+            return debugger.get_metrics(name)
+
+
+application = DockerDebuggerApp()
+app = application.app
+
+app.include_router(kubernetes_api.app)
+slots = kubernetes_api.slots

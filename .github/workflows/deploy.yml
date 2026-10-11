@@ -26,7 +26,7 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pytest tests -q
       - run: python cli.py examples/valid.yaml
-      - run: docker build -t kubernetes-manifest-debugger:deploy .
+      - run: docker build -t kubernetes-integrated-debugger:deploy .
       - name: Check configuration
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
@@ -42,7 +42,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
       - name: Package and deploy
         run: |
-          VERSION_LABEL="manifest-${GITHUB_SHA}-${GITHUB_RUN_ID}"
+          VERSION_LABEL="debugger-${GITHUB_SHA}-${GITHUB_RUN_ID}"
           BUNDLE_PATH="/tmp/${VERSION_LABEL}.zip"
           python scripts/package_source.py . "$BUNDLE_PATH"
           aws s3 cp "$BUNDLE_PATH" "s3://${EB_SOURCE_BUCKET}/${VERSION_LABEL}.zip"

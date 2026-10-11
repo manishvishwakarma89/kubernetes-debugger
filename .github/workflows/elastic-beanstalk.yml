@@ -1,0 +1,112 @@
+name: Test and deploy debugger to Elastic Beanstalk
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Test application
+        run: python -m pytest tests -q
+      - name: Validate example manifest
+        run: python cli.py examples/valid.yaml
+      - name: Build Docker image
+        run: docker build --pull -t debugger:${{ github.sha }} .
+      - name: Package source bundle
+        run: |
+          set -euo pipefail
+          test -f Dockerfile
+          zip -r "${RUNNER_TEMP}/debugger.zip" . \
+            -x '.git/*' '.github/*' '.venv/*' 'venv/*' \
+               '*/__pycache__/*' '__pycache__/*' '.pytest_cache/*' \
+               '.env' '.env.*' '*/.env' '*/.env.*' \
+               '*.pem' '*.key' '*.p12' '*.pfx' '*.pyc' '*.log' '*.zip' \
+               'node_modules/*' 'logs/*' 'certs/*' 'certificates/*' 'reports/*'
+          unzip -t "${RUNNER_TEMP}/debugger.zip"
+          unzip -Z1 "${RUNNER_TEMP}/debugger.zip" | grep -qx Dockerfile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beanstalk-source
+          path: ${{ runner.temp }}/debugger.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    needs: test-build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: aws-deployment
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: debugger-elastic-beanstalk-production
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EB_APPLICATION: ${{ vars.EB_APPLICATION }}
+      EB_ENVIRONMENT: ${{ vars.EB_ENVIRONMENT }}
+      EB_SOURCE_BUCKET: ${{ vars.EB_SOURCE_BUCKET }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: beanstalk-source
+          path: bundle
+      - name: Check configuration
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          for key in AWS_REGION EB_APPLICATION EB_ENVIRONMENT EB_SOURCE_BUCKET AWS_ROLE_ARN; do
+            if [ -z "${!key}" ]; then echo "Missing configuration: $key"; exit 1; fi
+          done
+      - name: Authenticate with AWS through OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: debugger-${{ github.run_id }}
+      - name: Upload and deploy source bundle
+        run: |
+          set -euo pipefail
+          VERSION_LABEL="debugger-${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SOURCE_KEY="debugger/${VERSION_LABEL}.zip"
+          ACTUAL_APP=$(aws elasticbeanstalk describe-environments --environment-names "$EB_ENVIRONMENT" --query 'Environments[0].ApplicationName' --output text)
+          if [ "$ACTUAL_APP" != "$EB_APPLICATION" ]; then echo 'Environment/application mismatch'; exit 1; fi
+          aws s3 cp bundle/debugger.zip "s3://${EB_SOURCE_BUCKET}/${SOURCE_KEY}" --only-show-errors
+          aws elasticbeanstalk create-application-version \
+            --application-name "$EB_APPLICATION" \
+            --version-label "$VERSION_LABEL" \
+            --source-bundle "S3Bucket=${EB_SOURCE_BUCKET},S3Key=${SOURCE_KEY}"
+          aws elasticbeanstalk update-environment \
+            --environment-name "$EB_ENVIRONMENT" --version-label "$VERSION_LABEL"
+          aws elasticbeanstalk wait environment-updated --environment-names "$EB_ENVIRONMENT"
+          DEPLOYED_VERSION=$(aws elasticbeanstalk describe-environments --environment-names "$EB_ENVIRONMENT" --query 'Environments[0].VersionLabel' --output text)
+          HEALTH=$(aws elasticbeanstalk describe-environments --environment-names "$EB_ENVIRONMENT" --query 'Environments[0].Health' --output text)
+          if [ "$DEPLOYED_VERSION" != "$VERSION_LABEL" ] || [ "$HEALTH" != Green ]; then
+            echo 'Deployment did not reach the expected version and Green health'; exit 1
+          fi
+          aws elasticbeanstalk describe-environments --environment-names "$EB_ENVIRONMENT" --query 'Environments[0].{Version:VersionLabel,Status:Status,Health:Health,CNAME:CNAME}'
+      - name: Show recent events on failure
+        if: failure()
+        run: |
+          if [ -n "$EB_ENVIRONMENT" ]; then
+            aws elasticbeanstalk describe-events --environment-name "$EB_ENVIRONMENT" --max-records 15 || true
+          fi
